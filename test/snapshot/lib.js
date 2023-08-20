@@ -2,7 +2,7 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const VM = require('../../src/virtual-machine');
-const JSGenerator = require('../../src/compiler/jsgen');
+const JSGenerator = require('../../src/wasm-compiler/jsgen');
 
 const executeDir = path.resolve(__dirname, '../fixtures/execute');
 // sb2 project loading results in random IDs each time, so for now we only snapshot sb3 files

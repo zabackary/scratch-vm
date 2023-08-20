@@ -1,5 +1,5 @@
 const {test} = require('tap');
-const jsexecute = require('../../src/compiler/jsexecute');
+const jsexecute = require('../../src/wasm-compiler/jsexecute');
 const Cast = require('../../src/util/cast');
 const {stringify} = require('@turbowarp/json');
 

@@ -211,7 +211,7 @@ class Thread {
          */
         this.generator = null;
         /**
-         * @type {Object.<string, import('../compiler/compile').CompiledScript>}
+         * @type {Object.<string, import('../wasm-compiler/compile').CompiledScript>}
          */
         this.procedures = null;
         this.executableHat = false;
@@ -459,7 +459,7 @@ class Thread {
         }
 
         // importing the compiler here avoids circular dependency issues
-        const compile = require('../compiler/compile');
+        const compile = require('../wasm-compiler/compile');
 
         this.triedToCompile = true;
 

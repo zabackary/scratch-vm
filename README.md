@@ -20,6 +20,11 @@ For a high-level overview of how the compiler works, see https://docs.turbowarp.
 
 For more technical information, read the code in src/compiler.
 
+> Note:
+> This fork will heavily modifier the code in `src/compiler`, so I've split the 
+> new WASM version into `src/wasm-compiler`. I'm hoping to make `wasm-compiler`
+> a drop-in replacement for `compiler` using `scratch-vm-wasm-runtime`.
+
 ## Public API
 
 This section was too out of date to be useful. We hope to re-add it as some point.
