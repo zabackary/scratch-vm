@@ -2,11 +2,12 @@ const log = require('../util/log');
 const Cast = require('../util/cast');
 const VariablePool = require('./variable-pool');
 const jsexecute = require('./jsexecute');
-const environment = require('./environment');
 
 // Imported for JSDoc types, not to actually use
-// eslint-disable-next-line no-unused-vars
+/* eslint-disable no-unused-vars */
 const {IntermediateScript, IntermediateRepresentation} = require('./intermediate');
+const {InstructionType} = require('scratch-vm-wasm-runtime');
+/* eslint-enable no-unused-vars */
 
 /**
  * @fileoverview Convert intermediate representations to JavaScript functions.
@@ -32,21 +33,6 @@ const TYPE_NUMBER_NAN = 5;
 // Pen-related constants
 const PEN_EXT = 'runtime.ext_pen';
 const PEN_STATE = `${PEN_EXT}._getPenState(target)`;
-
-/**
- * Variable pool used for factory function names.
- */
-const factoryNameVariablePool = new VariablePool('factory');
-
-/**
- * Variable pool used for generated functions (non-generator)
- */
-const functionNameVariablePool = new VariablePool('fun');
-
-/**
- * Variable pool used for generated generator functions.
- */
-const generatorNameVariablePool = new VariablePool('gen');
 
 /**
  * @typedef Input
@@ -206,99 +192,6 @@ class ConstantInput {
     }
 }
 
-/**
- * @implements {Input}
- */
-class VariableInput {
-    constructor (source) {
-        this.source = source;
-        this.type = TYPE_UNKNOWN;
-        /**
-         * The value this variable was most recently set to, if any.
-         * @type {Input}
-         * @private
-         */
-        this._value = null;
-    }
-
-    /**
-     * @param {Input} input The input this variable was most recently set to.
-     */
-    setInput (input) {
-        if (input instanceof VariableInput) {
-            // When being set to another variable, extract the value it was set to.
-            // Otherwise, you may end up with infinite recursion in analysis methods when a variable is set to itself.
-            if (input._value) {
-                input = input._value;
-            } else {
-                this.type = TYPE_UNKNOWN;
-                this._value = null;
-                return;
-            }
-        }
-        this._value = input;
-        if (input instanceof TypedInput) {
-            this.type = input.type;
-        } else {
-            this.type = TYPE_UNKNOWN;
-        }
-    }
-
-    asNumber () {
-        if (this.type === TYPE_NUMBER) return this.source;
-        if (this.type === TYPE_NUMBER_NAN) return `(${this.source} || 0)`;
-        return `(+${this.source} || 0)`;
-    }
-
-    asNumberOrNaN () {
-        if (this.type === TYPE_NUMBER || this.type === TYPE_NUMBER_NAN) return this.source;
-        return `(+${this.source})`;
-    }
-
-    asString () {
-        if (this.type === TYPE_STRING) return this.source;
-        return `("" + ${this.source})`;
-    }
-
-    asBoolean () {
-        if (this.type === TYPE_BOOLEAN) return this.source;
-        return `toBoolean(${this.source})`;
-    }
-
-    asColor () {
-        return this.asUnknown();
-    }
-
-    asUnknown () {
-        return this.source;
-    }
-
-    asSafe () {
-        return this.asUnknown();
-    }
-
-    isAlwaysNumber () {
-        if (this._value) {
-            return this._value.isAlwaysNumber();
-        }
-        return false;
-    }
-
-    isAlwaysNumberOrNaN () {
-        if (this._value) {
-            return this._value.isAlwaysNumberOrNaN();
-        }
-        return false;
-    }
-
-    isNeverNumber () {
-        if (this._value) {
-            return this._value.isNeverNumber();
-        }
-        return false;
-    }
-}
-
 const getNamesOfCostumesAndSounds = runtime => {
     const result = new Set();
     for (const target of runtime.targets) {
@@ -313,16 +206,6 @@ const getNamesOfCostumesAndSounds = runtime => {
         }
     }
     return result;
-};
-
-const isSafeConstantForEqualsOptimization = input => {
-    const numberValue = +input.constantValue;
-    // Do not optimize 0
-    if (!numberValue) {
-        return false;
-    }
-    // Do not optimize numbers when the original form does not match
-    return numberValue.toString() === input.constantValue.toString();
 };
 
 /**
@@ -345,6 +228,42 @@ class Frame {
     }
 }
 
+class BytecodeInstruction {
+    /**
+     * Creates an instruction to add the bytecode.
+     *
+     * @param {InstructionType} type The type of the instruction
+     * @param {number} argument The argument for the instruction, internally a
+     * u32 but represented as a `number`
+     */
+    constructor (type, argument) {
+        /**
+         * The instruction type
+         * @type {InstructionType}
+         */
+        this.type = type;
+        /**
+         * The argument
+         * @type {number}
+         */
+        this.arg = argument || 0;
+    }
+
+    /**
+     * Writes the bytecode for the instruction a buffer.
+     *
+     * @param {ArrayBuffer} buffer The buffer to write to
+     * @param {number} offset The offset of the buffer
+     */
+    writeToBuffer (buffer, offset) {
+        const instruction = new DataView(buffer, offset + 0, 2);
+        // 2 bytes of padding in between
+        const argument = new DataView(buffer, offset + 4, 4);
+        instruction.setUint16(this.type);
+        argument.setUint32(this.arg);
+    }
+}
+
 class JSGenerator {
     /**
      * @param {IntermediateScript} script
@@ -356,11 +275,31 @@ class JSGenerator {
         this.ir = ir;
         this.target = target;
         this.source = '';
+        /** @type {Array.<BytecodeInstruction>} */
+        this.bytecodeSourceList = [];
 
         /**
          * @type {Object.<string, VariableInput>}
          */
         this.variableInputs = {};
+
+        /**
+         * An array of constant values.
+         * @type {Array.<string | number | boolean>}
+         */
+        this.constants = [];
+
+        /**
+         * An array of list IDs
+         * @type {Array.<string>}
+         */
+        this.lists = [];
+
+        /**
+         * An array of variable IDs
+         * @type {Array.<string>}
+         */
+        this.variables = [];
 
         this.isWarp = script.isWarp;
         this.isProcedure = script.isProcedure;
@@ -424,204 +363,274 @@ class JSGenerator {
     }
 
     /**
+     * @param {any[]} stack The stack to compile.
+     * @returns {BytecodeInstruction[]} The instructions compiled.
+     */
+    descendStack (stack) {
+        const output = [];
+        for (const node of stack) {
+            output.push(...this.descendStackedBlock(node));
+        }
+        return output;
+    }
+
+    /**
+     * Gets the key for the next constant
+     * @param {string | number | boolean} value The constant value
+     * @returns {number} The key in the constants array of the value
+     */
+    referenceConstant (value) {
+        const cached = this.constants.indexOf(value);
+        if (cached > -1) return cached;
+        return this.constants.push(value) - 1;
+    }
+
+    /**
+     * Gets the key for the next list
+     * @param {*} list The list to reference
+     * @returns {number} The key in the list array of the value
+     */
+    referenceList (list) {
+        const cached = this.lists.indexOf(list.id);
+        if (cached > -1) return cached;
+        return this.lists.push(list.id) - 1;
+    }
+
+    /**
+     * Gets the key for the next variable
+     * @param {*} variable The variable to reference
+     * @returns {number} The key in the list array of the value
+     */
+    referenceWasmVariable (variable) {
+        const cached = this.lists.indexOf(variable.id);
+        if (cached > -1) return cached;
+        return this.lists.push(variable.id) - 1;
+    }
+
+    /**
      * @param {object} node Input node to compile.
-     * @returns {Input} Compiled input.
+     * @returns {BytecodeInstruction[]} The exact instructions to run to load
+     * the output of the node onto the top of the stack.
      */
     descendInput (node) {
+        log.debug(node);
         switch (node.kind) {
-        case 'addons.call':
-            return new TypedInput(`(${this.descendAddonCall(node)})`, TYPE_UNKNOWN);
+        case 'addons.call': {
+            log.warn('WASM: Compiler does not support addons');
+            throw new Error('failed to compile (see above)');
+        }
 
         case 'args.boolean':
+            // needs explanation
             return new TypedInput(`toBoolean(p${node.index})`, TYPE_BOOLEAN);
         case 'args.stringNumber':
+            // needs explanation
             return new TypedInput(`p${node.index}`, TYPE_UNKNOWN);
 
-        case 'compat':
-            // Compatibility layer inputs never use flags.
-            return new TypedInput(`(${this.generateCompatibilityLayerCall(node, false)})`, TYPE_UNKNOWN);
+        case 'compat': {
+            log.warn('WASM: Compiler does not support compat blocks');
+            throw new Error('failed to compile (see above)');
+        }
 
         case 'constant':
-            return this.safeConstantInput(node.value);
+            return [
+                new BytecodeInstruction(InstructionType.LoadConst, this.referenceConstant(node.value))
+            ];
 
         case 'keyboard.pressed':
+            // relies on runtime
             return new TypedInput(`runtime.ioDevices.keyboard.getKeyIsDown(${this.descendInput(node.key).asSafe()})`, TYPE_BOOLEAN);
 
         case 'list.contains':
-            return new TypedInput(`listContains(${this.referenceVariable(node.list)}, ${this.descendInput(node.item).asUnknown()})`, TYPE_BOOLEAN);
+            return [
+                ...this.descendInput(node.item),
+                new BytecodeInstruction(InstructionType.ListIIncludes, this.referenceList(node.list))
+            ];
+            
         case 'list.contents':
-            return new TypedInput(`listContents(${this.referenceVariable(node.list)})`, TYPE_STRING);
-        case 'list.get': {
-            const index = this.descendInput(node.index);
-            if (environment.supportsNullishCoalescing) {
-                if (index.isAlwaysNumberOrNaN()) {
-                    return new TypedInput(`(${this.referenceVariable(node.list)}.value[(${index.asNumber()} | 0) - 1] ?? "")`, TYPE_UNKNOWN);
-                }
-                if (index instanceof ConstantInput && index.constantValue === 'last') {
-                    return new TypedInput(`(${this.referenceVariable(node.list)}.value[${this.referenceVariable(node.list)}.value.length - 1] ?? "")`, TYPE_UNKNOWN);
-                }
-            }
-            return new TypedInput(`listGet(${this.referenceVariable(node.list)}.value, ${index.asUnknown()})`, TYPE_UNKNOWN);
-        }
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn('WASM: No compiler implementation for `list.contents`');
+            throw new Error('failed to compile (see above)');
+        case 'list.get':
+            return [
+                ...this.descendInput(node.index),
+                new BytecodeInstruction(InstructionType.ListLoad, this.referenceList(node.list))
+            ];
         case 'list.indexOf':
-            return new TypedInput(`listIndexOf(${this.referenceVariable(node.list)}, ${this.descendInput(node.item).asUnknown()})`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.item),
+                new BytecodeInstruction(InstructionType.ListIFind, this.referenceList(node.list))
+            ];
         case 'list.length':
-            return new TypedInput(`${this.referenceVariable(node.list)}.value.length`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.ListLen, this.referenceList(node.list))
+            ];
 
         case 'looks.size':
-            return new TypedInput('Math.round(target.size)', TYPE_NUMBER);
         case 'looks.backdropName':
-            return new TypedInput('stage.getCostumes()[stage.currentCostume].name', TYPE_STRING);
         case 'looks.backdropNumber':
-            return new TypedInput('(stage.currentCostume + 1)', TYPE_NUMBER);
         case 'looks.costumeName':
-            return new TypedInput('target.getCostumes()[target.currentCostume].name', TYPE_STRING);
         case 'looks.costumeNumber':
-            return new TypedInput('(target.currentCostume + 1)', TYPE_NUMBER);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
 
         case 'motion.direction':
-            return new TypedInput('target.direction', TYPE_NUMBER);
         case 'motion.x':
-            return new TypedInput('limitPrecision(target.x)', TYPE_NUMBER);
         case 'motion.y':
-            return new TypedInput('limitPrecision(target.y)', TYPE_NUMBER);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
 
         case 'mouse.down':
-            return new TypedInput('runtime.ioDevices.mouse.getIsDown()', TYPE_BOOLEAN);
         case 'mouse.x':
-            return new TypedInput('runtime.ioDevices.mouse.getScratchX()', TYPE_NUMBER);
         case 'mouse.y':
-            return new TypedInput('runtime.ioDevices.mouse.getScratchY()', TYPE_NUMBER);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
 
         case 'noop':
-            return new TypedInput('""', TYPE_STRING);
+            // This could also add a no-op instruction to the bytecode
+            return [];
 
         case 'op.abs':
-            return new TypedInput(`Math.abs(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryAbs)
+            ];
         case 'op.acos':
-            // Needs to be marked as NaN because Math.acos(1.0001) === NaN
-            return new TypedInput(`((Math.acos(${this.descendInput(node.value).asNumber()}) * 180) / Math.PI)`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryAcos)
+            ];
         case 'op.add':
-            // Needs to be marked as NaN because Infinity + -Infinity === NaN
-            return new TypedInput(`(${this.descendInput(node.left).asNumber()} + ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpAdd)
+            ];
         case 'op.and':
-            return new TypedInput(`(${this.descendInput(node.left).asBoolean()} && ${this.descendInput(node.right).asBoolean()})`, TYPE_BOOLEAN);
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpAnd)
+            ];
         case 'op.asin':
-            // Needs to be marked as NaN because Math.asin(1.0001) === NaN
-            return new TypedInput(`((Math.asin(${this.descendInput(node.value).asNumber()}) * 180) / Math.PI)`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryAsin)
+            ];
         case 'op.atan':
-            return new TypedInput(`((Math.atan(${this.descendInput(node.value).asNumber()}) * 180) / Math.PI)`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryAtan)
+            ];
         case 'op.ceiling':
-            return new TypedInput(`Math.ceil(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryCeil)
+            ];
         case 'op.contains':
-            return new TypedInput(`(${this.descendInput(node.string).asString()}.toLowerCase().indexOf(${this.descendInput(node.contains).asString()}.toLowerCase()) !== -1)`, TYPE_BOOLEAN);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
         case 'op.cos':
-            return new TypedInput(`(Math.round(Math.cos((Math.PI * ${this.descendInput(node.value).asNumber()}) / 180) * 1e10) / 1e10)`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryCos)
+            ];
         case 'op.divide':
-            // Needs to be marked as NaN because 0 / 0 === NaN
-            return new TypedInput(`(${this.descendInput(node.left).asNumber()} / ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
-        case 'op.equals': {
-            const left = this.descendInput(node.left);
-            const right = this.descendInput(node.right);
-            // When both operands are known to never be numbers, only use string comparison to avoid all number parsing.
-            if (left.isNeverNumber() || right.isNeverNumber()) {
-                return new TypedInput(`(${left.asString()}.toLowerCase() === ${right.asString()}.toLowerCase())`, TYPE_BOOLEAN);
-            }
-            const leftAlwaysNumber = left.isAlwaysNumber();
-            const rightAlwaysNumber = right.isAlwaysNumber();
-            // When both operands are known to be numbers, we can use ===
-            if (leftAlwaysNumber && rightAlwaysNumber) {
-                return new TypedInput(`(${left.asNumber()} === ${right.asNumber()})`, TYPE_BOOLEAN);
-            }
-            // In certain conditions, we can use === when one of the operands is known to be a safe number.
-            if (leftAlwaysNumber && left instanceof ConstantInput && isSafeConstantForEqualsOptimization(left)) {
-                return new TypedInput(`(${left.asNumber()} === ${right.asNumber()})`, TYPE_BOOLEAN);
-            }
-            if (rightAlwaysNumber && right instanceof ConstantInput && isSafeConstantForEqualsOptimization(right)) {
-                return new TypedInput(`(${left.asNumber()} === ${right.asNumber()})`, TYPE_BOOLEAN);
-            }
-            // No compile-time optimizations possible - use fallback method.
-            return new TypedInput(`compareEqual(${left.asUnknown()}, ${right.asUnknown()})`, TYPE_BOOLEAN);
-        }
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpDivide)
+            ];
+        case 'op.equals':
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpEq)
+            ];
         case 'op.e^':
-            return new TypedInput(`Math.exp(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryEPow)
+            ];
         case 'op.floor':
-            return new TypedInput(`Math.floor(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
-        case 'op.greater': {
-            const left = this.descendInput(node.left);
-            const right = this.descendInput(node.right);
-            // When the left operand is a number and the right operand is a number or NaN, we can use >
-            if (left.isAlwaysNumber() && right.isAlwaysNumberOrNaN()) {
-                return new TypedInput(`(${left.asNumber()} > ${right.asNumberOrNaN()})`, TYPE_BOOLEAN);
-            }
-            // When the left operand is a number or NaN and the right operand is a number, we can negate <=
-            if (left.isAlwaysNumberOrNaN() && right.isAlwaysNumber()) {
-                return new TypedInput(`!(${left.asNumberOrNaN()} <= ${right.asNumber()})`, TYPE_BOOLEAN);
-            }
-            // When either operand is known to never be a number, avoid all number parsing.
-            if (left.isNeverNumber() || right.isNeverNumber()) {
-                return new TypedInput(`(${left.asString()}.toLowerCase() > ${right.asString()}.toLowerCase())`, TYPE_BOOLEAN);
-            }
-            // No compile-time optimizations possible - use fallback method.
-            return new TypedInput(`compareGreaterThan(${left.asUnknown()}, ${right.asUnknown()})`, TYPE_BOOLEAN);
-        }
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryFloor)
+            ];
+        case 'op.greater':
+            return [
+                ...this.descendInput(node.right),
+                ...this.descendInput(node.left),
+                new BytecodeInstruction(InstructionType.OpLt)
+            ];
         case 'op.join':
-            return new TypedInput(`(${this.descendInput(node.left).asString()} + ${this.descendInput(node.right).asString()})`, TYPE_STRING);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
         case 'op.length':
-            return new TypedInput(`${this.descendInput(node.string).asString()}.length`, TYPE_NUMBER);
-        case 'op.less': {
-            const left = this.descendInput(node.left);
-            const right = this.descendInput(node.right);
-            // When the left operand is a number or NaN and the right operand is a number, we can use <
-            if (left.isAlwaysNumberOrNaN() && right.isAlwaysNumber()) {
-                return new TypedInput(`(${left.asNumberOrNaN()} < ${right.asNumber()})`, TYPE_BOOLEAN);
-            }
-            // When the left operand is a number and the right operand is a number or NaN, we can negate >=
-            if (left.isAlwaysNumber() && right.isAlwaysNumberOrNaN()) {
-                return new TypedInput(`!(${left.asNumber()} >= ${right.asNumberOrNaN()})`, TYPE_BOOLEAN);
-            }
-            // When either operand is known to never be a number, avoid all number parsing.
-            if (left.isNeverNumber() || right.isNeverNumber()) {
-                return new TypedInput(`(${left.asString()}.toLowerCase() < ${right.asString()}.toLowerCase())`, TYPE_BOOLEAN);
-            }
-            // No compile-time optimizations possible - use fallback method.
-            return new TypedInput(`compareLessThan(${left.asUnknown()}, ${right.asUnknown()})`, TYPE_BOOLEAN);
-        }
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
+        case 'op.less':
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpLt)
+            ];
         case 'op.letterOf':
-            return new TypedInput(`((${this.descendInput(node.string).asString()})[(${this.descendInput(node.letter).asNumber()} | 0) - 1] || "")`, TYPE_STRING);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
         case 'op.ln':
-            // Needs to be marked as NaN because Math.log(-1) == NaN
-            return new TypedInput(`Math.log(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryLn)
+            ];
         case 'op.log':
-            // Needs to be marked as NaN because Math.log(-1) == NaN
-            return new TypedInput(`(Math.log(${this.descendInput(node.value).asNumber()}) / Math.LN10)`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryLog)
+            ];
         case 'op.mod':
-            this.descendedIntoModulo = true;
-            // Needs to be marked as NaN because mod(0, 0) (and others) == NaN
-            return new TypedInput(`mod(${this.descendInput(node.left).asNumber()}, ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
         case 'op.multiply':
-            // Needs to be marked as NaN because Infinity * 0 === NaN
-            return new TypedInput(`(${this.descendInput(node.left).asNumber()} * ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpMultiply)
+            ];
         case 'op.not':
-            return new TypedInput(`!${this.descendInput(node.operand).asBoolean()}`, TYPE_BOOLEAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryNot)
+            ];
         case 'op.or':
-            return new TypedInput(`(${this.descendInput(node.left).asBoolean()} || ${this.descendInput(node.right).asBoolean()})`, TYPE_BOOLEAN);
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpOr)
+            ];
         case 'op.random':
-            if (node.useInts) {
-                // Both inputs are ints, so we know neither are NaN
-                return new TypedInput(`randomInt(${this.descendInput(node.low).asNumber()}, ${this.descendInput(node.high).asNumber()})`, TYPE_NUMBER);
-            }
-            if (node.useFloats) {
-                return new TypedInput(`randomFloat(${this.descendInput(node.low).asNumber()}, ${this.descendInput(node.high).asNumber()})`, TYPE_NUMBER_NAN);
-            }
-            return new TypedInput(`runtime.ext_scratch3_operators._random(${this.descendInput(node.low).asUnknown()}, ${this.descendInput(node.high).asUnknown()})`, TYPE_NUMBER_NAN);
         case 'op.round':
-            return new TypedInput(`Math.round(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
+            // TODO needs implementation in scratch-vm-wasm-runtime
+            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
+            throw new Error('failed to compile (see above)');
         case 'op.sin':
-            return new TypedInput(`(Math.round(Math.sin((Math.PI * ${this.descendInput(node.value).asNumber()}) / 180) * 1e10) / 1e10)`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnarySin)
+            ];
         case 'op.sqrt':
-            // Needs to be marked as NaN because Math.sqrt(-1) === NaN
-            return new TypedInput(`Math.sqrt(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnarySqrt)
+            ];
         case 'op.subtract':
             // Needs to be marked as NaN because Infinity - Infinity === NaN
             return new TypedInput(`(${this.descendInput(node.left).asNumber()} - ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
@@ -749,22 +758,18 @@ class JSGenerator {
 
     /**
      * @param {*} node Stacked node to compile.
+     * @returns {BytecodeInstruction[]} Pops the stack
      */
     descendStackedBlock (node) {
         switch (node.kind) {
-        case 'addons.call':
-            this.source += `${this.descendAddonCall(node)};\n`;
-            break;
+        case 'addons.call': {
+            log.warn('WASM: Compiler does not support addons');
+            throw new Error('failed to compile (see above)');
+        }
 
         case 'compat': {
-            // If the last command in a loop returns a promise, immediately continue to the next iteration.
-            // If you don't do this, the loop effectively yields twice per iteration and will run at half-speed.
-            const isLastInLoop = this.isLastBlockInLoop();
-            this.source += `${this.generateCompatibilityLayerCall(node, isLastInLoop)};\n`;
-            if (isLastInLoop) {
-                this.source += 'if (hasResumedFromPromise) {hasResumedFromPromise = false;continue;}\n';
-            }
-            break;
+            log.warn('WASM: Compiler does not support compat blocks');
+            throw new Error('failed to compile (see above)');
         }
 
         case 'control.createClone':
@@ -1127,85 +1132,13 @@ class JSGenerator {
             break;
 
         case 'visualReport': {
-            const value = this.localVariables.next();
-            this.source += `const ${value} = ${this.descendInput(node.input).asUnknown()};`;
-            // blocks like legacy no-ops can return a literal `undefined`
-            this.source += `if (${value} !== undefined) runtime.visualReport("${sanitize(this.script.topBlockId)}", ${value});\n`;
-            break;
+            return this.descendInput(node.input);
         }
 
         default:
             log.warn(`JS: Unknown stacked block: ${node.kind}`, node);
             throw new Error(`JS: Unknown stacked block: ${node.kind}`);
         }
-    }
-
-    /**
-     * Compile a Record of input objects into a safe JS string.
-     * @param {Record<string, unknown>} inputs
-     * @returns {string}
-     */
-    descendInputRecord (inputs) {
-        let result = '{';
-        for (const name of Object.keys(inputs)) {
-            const node = inputs[name];
-            result += `"${sanitize(name)}":${this.descendInput(node).asSafe()},`;
-        }
-        result += '}';
-        return result;
-    }
-
-    resetVariableInputs () {
-        this.variableInputs = {};
-    }
-
-    descendStack (nodes, frame) {
-        // Entering a stack -- all bets are off.
-        // TODO: allow if/else to inherit values
-        this.resetVariableInputs();
-        this.pushFrame(frame);
-
-        for (let i = 0; i < nodes.length; i++) {
-            frame.isLastBlock = i === nodes.length - 1;
-            this.descendStackedBlock(nodes[i]);
-        }
-
-        // Leaving a stack -- any assumptions made in the current stack do not apply outside of it
-        // TODO: in if/else this might create an extra unused object
-        this.resetVariableInputs();
-        this.popFrame();
-    }
-
-    descendVariable (variable) {
-        if (this.variableInputs.hasOwnProperty(variable.id)) {
-            return this.variableInputs[variable.id];
-        }
-        const input = new VariableInput(`${this.referenceVariable(variable)}.value`);
-        this.variableInputs[variable.id] = input;
-        return input;
-    }
-
-    referenceVariable (variable) {
-        if (variable.scope === 'target') {
-            return this.evaluateOnce(`target.variables["${sanitize(variable.id)}"]`);
-        }
-        return this.evaluateOnce(`stage.variables["${sanitize(variable.id)}"]`);
-    }
-
-    descendAddonCall (node) {
-        const inputs = this.descendInputRecord(node.arguments);
-        const blockFunction = `runtime.getAddonBlock("${sanitize(node.code)}").callback`;
-        const blockId = `"${sanitize(node.blockId)}"`;
-        return `yield* executeInCompatibilityLayer(${inputs}, ${blockFunction}, ${this.isWarp}, false, ${blockId})`;
-    }
-
-    evaluateOnce (source) {
-        if (this._setupVariables.hasOwnProperty(source)) {
-            return this._setupVariables[source];
-        }
-        const variable = this._setupVariablesPool.next();
-        this._setupVariables[source] = variable;
-        return variable;
     }
 
     retire () {
@@ -1238,138 +1171,10 @@ class JSGenerator {
         }
     }
 
-    yieldLoop () {
-        if (this.warpTimer) {
-            this.yieldStuckOrNotWarp();
-        } else {
-            this.yieldNotWarp();
-        }
-    }
-
-    /**
-     * Write JS to yield the current thread if warp mode is disabled.
-     */
-    yieldNotWarp () {
-        if (!this.isWarp) {
-            this.source += 'yield;\n';
-            this.yielded();
-        }
-    }
-
-    /**
-     * Write JS to yield the current thread if warp mode is disabled or if the script seems to be stuck.
-     */
-    yieldStuckOrNotWarp () {
-        if (this.isWarp) {
-            this.source += 'if (isStuck()) yield;\n';
-        } else {
-            this.source += 'yield;\n';
-        }
-        this.yielded();
-    }
-
-    yielded () {
-        if (!this.script.yields) {
-            throw new Error('Script yielded but is not marked as yielding.');
-        }
-        // Control may have been yielded to another script -- all bets are off.
-        this.resetVariableInputs();
-    }
-
     /**
      * Write JS to request a redraw.
      */
     requestRedraw () {
-        this.source += 'runtime.requestRedraw();\n';
-    }
-
-    safeConstantInput (value) {
-        const unsafe = typeof value === 'string' && this.namesOfCostumesAndSounds.has(value);
-        return new ConstantInput(value, !unsafe);
-    }
-
-    /**
-     * Generate a call into the compatibility layer.
-     * @param {*} node The "compat" kind node to generate from.
-     * @param {boolean} setFlags Whether flags should be set describing how this function was processed.
-     * @returns {string} The JS of the call.
-     */
-    generateCompatibilityLayerCall (node, setFlags) {
-        const opcode = node.opcode;
-
-        let result = 'yield* executeInCompatibilityLayer({';
-
-        for (const inputName of Object.keys(node.inputs)) {
-            const input = node.inputs[inputName];
-            const compiledInput = this.descendInput(input).asSafe();
-            result += `"${sanitize(inputName)}":${compiledInput},`;
-        }
-        for (const fieldName of Object.keys(node.fields)) {
-            const field = node.fields[fieldName];
-            result += `"${sanitize(fieldName)}":"${sanitize(field)}",`;
-        }
-        const opcodeFunction = this.evaluateOnce(`runtime.getOpcodeFunction("${sanitize(opcode)}")`);
-        result += `}, ${opcodeFunction}, ${this.isWarp}, ${setFlags}, null)`;
-
-        return result;
-    }
-
-    getScriptFactoryName () {
-        return factoryNameVariablePool.next();
-    }
-
-    getScriptName (yields) {
-        let name = yields ? generatorNameVariablePool.next() : functionNameVariablePool.next();
-        if (this.isProcedure) {
-            const simplifiedProcedureCode = this.script.procedureCode
-                .replace(/%[\w]/g, '') // remove arguments
-                .replace(/[^a-zA-Z0-9]/g, '_') // remove unsafe
-                .substring(0, 20); // keep length reasonable
-            name += `_${simplifiedProcedureCode}`;
-        }
-        return name;
-    }
-
-    /**
-     * Generate the JS to pass into eval() based on the current state of the compiler.
-     * @returns {string} JS to pass into eval()
-     */
-    createScriptFactory () {
-        let script = '';
-
-        // Setup the factory
-        script += `(function ${this.getScriptFactoryName()}(thread) { `;
-        script += 'const target = thread.target; ';
-        script += 'const runtime = target.runtime; ';
-        script += 'const stage = runtime.getTargetForStage();\n';
-        for (const varValue of Object.keys(this._setupVariables)) {
-            const varName = this._setupVariables[varValue];
-            script += `const ${varName} = ${varValue};\n`;
-        }
-
-        // Generated script
-        script += 'return ';
-        if (this.script.yields) {
-            script += `function* `;
-        } else {
-            script += `function `;
-        }
-        script += this.getScriptName(this.script.yields);
-        script += ' (';
-        if (this.script.arguments.length) {
-            const args = [];
-            for (let i = 0; i < this.script.arguments.length; i++) {
-                args.push(`p${i}`);
-            }
-            script += args.join(',');
-        }
-        script += ') {\n';
-
-        script += this.source;
-
-        script += '}; })';
-
-        return script;
     }
 
     /**
@@ -1377,20 +1182,27 @@ class JSGenerator {
      * @returns {Function} The factory function for the script.
      */
     compile () {
+        let stackBytecode = [];
         if (this.script.stack) {
-            this.descendStack(this.script.stack, new Frame(false));
+            log.debug('descending into', this.script.stack);
+            stackBytecode = this.descendStack(this.script.stack, new Frame(false));
         }
         this.stopScript();
 
-        const factory = this.createScriptFactory();
-        const fn = jsexecute.scopedEval(factory);
+        const fn = () => jsexecute.scopedExecute(function*(globalState) {
+            yield;
+            log.debug('hi there, running');
+            log.debug(globalState);
+            // Finish thread
+            globalState.thread.target.runtime.sequencer.retireThread(globalState.thread);
+        });
 
         if (this.debug) {
-            log.info(`JS: ${this.target.getName()}: compiled ${this.script.procedureCode || 'script'}`, factory);
+            log.info(`bytecode: ${this.target.getName()}: compiled`, stackBytecode);
         }
 
         if (JSGenerator.testingApparatus) {
-            JSGenerator.testingApparatus.report(this, factory);
+            log.warn('uh, not sure what the testingApparatus is for, here it is if you care:', JSGenerator.testingApparatus);
         }
 
         return fn;

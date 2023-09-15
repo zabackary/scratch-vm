@@ -612,6 +612,9 @@ const scopedEval = source => {
     }
 };
 
+const scopedExecute = fn => () => fn(globalState);
+
+execute.scopedExecute = scopedExecute;
 execute.scopedEval = scopedEval;
 execute.runtimeFunctions = runtimeFunctions;
 execute.saveGlobalState = saveGlobalState;

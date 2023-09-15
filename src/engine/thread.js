@@ -457,60 +457,63 @@ class Thread {
         if (!this.blockContainer) {
             return;
         }
-
+        // I think the transpiler re-assigns this in an async require, so need this
+        const parentThis = this;
         // importing the compiler here avoids circular dependency issues
-        const compile = require('../wasm-compiler/compile');
+        require(['../wasm-compiler/compile'], compile => {
+            parentThis.triedToCompile = true;
 
-        this.triedToCompile = true;
+            // stackClick === true disables hat block generation
+            // It would be great to cache these separately, but for now it's easiest to just disable them to avoid
+            // cached versions of scripts breaking projects.
+            const canCache = !parentThis.stackClick;
 
-        // stackClick === true disables hat block generation
-        // It would be great to cache these separately, but for now it's easiest to just disable them to avoid
-        // cached versions of scripts breaking projects.
-        const canCache = !this.stackClick;
-
-        const topBlock = this.topBlock;
-        // Flyout blocks are stored in a special block container.
-        const blocks = this.blockContainer.getBlock(topBlock) ? this.blockContainer : this.target.runtime.flyoutBlocks;
-        const cachedResult = canCache && blocks.getCachedCompileResult(topBlock);
-        // If there is a cached error, do not attempt to recompile.
-        if (cachedResult && !cachedResult.success) {
-            return;
-        }
-
-        let result;
-        if (cachedResult) {
-            result = cachedResult.value;
-        } else {
-            try {
-                result = compile(this);
-                if (canCache) {
-                    blocks.cacheCompileResult(topBlock, result);
-                }
-            } catch (error) {
-                log.error('cannot compile script', this.target.getName(), error);
-                if (canCache) {
-                    blocks.cacheCompileError(topBlock, error);
-                }
-                this.target.runtime.emitCompileError(this.target, error);
+            const topBlock = parentThis.topBlock;
+            // Flyout blocks are stored in a special block container.
+            const blocks = parentThis.blockContainer.getBlock(topBlock) ?
+                parentThis.blockContainer :
+                parentThis.target.runtime.flyoutBlocks;
+            const cachedResult = canCache && blocks.getCachedCompileResult(topBlock);
+            // If there is a cached error, do not attempt to recompile.
+            if (cachedResult && !cachedResult.success) {
                 return;
             }
-        }
 
-        this.procedures = {};
-        for (const procedureCode of Object.keys(result.procedures)) {
-            this.procedures[procedureCode] = result.procedures[procedureCode](this);
-        }
+            let result;
+            if (cachedResult) {
+                result = cachedResult.value;
+            } else {
+                try {
+                    result = compile(parentThis);
+                    if (canCache) {
+                        blocks.cacheCompileResult(topBlock, result);
+                    }
+                } catch (error) {
+                    log.error('cannot compile script', parentThis.target.getName(), error);
+                    if (canCache) {
+                        blocks.cacheCompileError(topBlock, error);
+                    }
+                    parentThis.target.runtime.emitCompileError(parentThis.target, error);
+                    return;
+                }
+            }
 
-        this.generator = result.startingFunction(this)();
+            parentThis.procedures = {};
+            for (const procedureCode of Object.keys(result.procedures)) {
+                parentThis.procedures[procedureCode] = result.procedures[procedureCode](parentThis);
+            }
 
-        this.executableHat = result.executableHat;
+            parentThis.generator = result.startingFunction(parentThis)();
 
-        if (!this.blockContainer.forceNoGlow) {
-            this.blockGlowInFrame = this.topBlock;
-            this.requestScriptGlowInFrame = true;
-        }
+            parentThis.executableHat = result.executableHat;
 
-        this.isCompiled = true;
+            if (!parentThis.blockContainer.forceNoGlow) {
+                parentThis.blockGlowInFrame = parentThis.topBlock;
+                parentThis.requestScriptGlowInFrame = true;
+            }
+
+            parentThis.isCompiled = true;
+        });
     }
 }
 
