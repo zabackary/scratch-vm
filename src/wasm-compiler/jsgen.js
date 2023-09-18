@@ -2,11 +2,13 @@ const log = require('../util/log');
 const Cast = require('../util/cast');
 const VariablePool = require('./variable-pool');
 const jsexecute = require('./jsexecute');
+// eslint-disable-next-line camelcase
+const {run_sync} = require('scratch-vm-wasm-runtime');
+const {InstructionType, ReturnReason} = require('scratch-vm-wasm-runtime/scratch_vm_wasm_runtime');
 
 // Imported for JSDoc types, not to actually use
 /* eslint-disable no-unused-vars */
 const {IntermediateScript, IntermediateRepresentation} = require('./intermediate');
-const {InstructionType} = require('scratch-vm-wasm-runtime');
 /* eslint-enable no-unused-vars */
 
 /**
@@ -259,8 +261,8 @@ class BytecodeInstruction {
         const instruction = new DataView(buffer, offset + 0, 2);
         // 2 bytes of padding in between
         const argument = new DataView(buffer, offset + 4, 4);
-        instruction.setUint16(this.type);
-        argument.setUint32(this.arg);
+        instruction.setUint16(0, this.type, true);
+        argument.setUint32(0, this.arg, true);
     }
 }
 
@@ -1132,7 +1134,10 @@ class JSGenerator {
             break;
 
         case 'visualReport': {
-            return this.descendInput(node.input);
+            return [
+                ...this.descendInput(node.input),
+                new BytecodeInstruction(InstructionType.Return, ReturnReason.VisualReport)
+            ];
         }
 
         default:
@@ -1172,9 +1177,20 @@ class JSGenerator {
     }
 
     /**
-     * Write JS to request a redraw.
+     * Checks if the browser is compatible with BigUint64Array and alerts if it
+     * isn't.
+     * @returns a boolean indicating support
      */
-    requestRedraw () {
+    compatCheck () {
+        try {
+            // eslint-disable-next-line no-undef
+            const _ = new BigUint64Array(0);
+        } catch (_) {
+            // eslint-disable-next-line no-alert
+            alert("Your browser doesn't support the technologies needed.");
+            return false;
+        }
+        return true;
     }
 
     /**
@@ -1182,23 +1198,79 @@ class JSGenerator {
      * @returns {Function} The factory function for the script.
      */
     compile () {
-        let stackBytecode = [];
+        if (!this.compatCheck()) throw new Error('stopping due to no support');
+        let stackBytecodeInstructions = [];
         if (this.script.stack) {
             log.debug('descending into', this.script.stack);
-            stackBytecode = this.descendStack(this.script.stack, new Frame(false));
+            stackBytecodeInstructions = this.descendStack(this.script.stack, new Frame(false));
         }
+        // Process the bytecode
+        const bytecodeBuffer = new ArrayBuffer(stackBytecodeInstructions.length * 8);
+        stackBytecodeInstructions.forEach((instruction, index) => {
+            instruction.writeToBuffer(bytecodeBuffer, index * 8);
+        });
+        // I think eslint is set up to support older browsers; compat check
+        // already exists
+        // eslint-disable-next-line no-undef
+        const bytecode = new BigUint64Array(bytecodeBuffer);
+        // Process the constants, vars, lists
+        const constants = new Map();
+        this.constants.forEach((constant, index) => {
+            constants.set(index, constant);
+        });
+        const lists = new Map();
+        const variables = new Map();
+        const refreshVars = (target, stage) => {
+            lists.clear();
+            this.lists.forEach((listID, index) => {
+                let list;
+                if (target.variables.hasOwnProperty(listID)) {
+                    // Assume it's on the sprite, not the stage
+                    list = target.variables[listID].value;
+                } else {
+                    list = stage.variables[listID].value;
+                }
+                lists.set(index, list.join('\0'));
+            });
+            variables.clear();
+            this.variables.forEach((variableID, index) => {
+                let variable;
+                if (target.variables.hasOwnProperty(variableID)) {
+                    // Assume it's on the sprite, not the stage
+                    variable = target.variables[variableID].value;
+                } else {
+                    variable = stage.variables[variableID].value;
+                }
+                variables.set(index, variable);
+            });
+        };
+        
         this.stopScript();
 
         const fn = () => jsexecute.scopedExecute(function*(globalState) {
             yield;
+            const target = globalState.thread.target;
+            log.debug(target);
+            const runtime = target.runtime;
+            const stage = runtime.getTargetForStage();
+            refreshVars(target, stage);
+            log.debug('running with', bytecode, constants, variables, lists);
+            log.debug(Object.fromEntries(run_sync(
+                /* initial_project_counter: */ 0,
+                /* initial_stack: */ [],
+                bytecode,
+                constants,
+                variables,
+                lists
+            )));
             log.debug('hi there, running');
             log.debug(globalState);
             // Finish thread
-            globalState.thread.target.runtime.sequencer.retireThread(globalState.thread);
+            runtime.sequencer.retireThread(globalState.thread);
         });
 
         if (this.debug) {
-            log.info(`bytecode: ${this.target.getName()}: compiled`, stackBytecode);
+            log.info(`bytecode: ${this.target.getName()}: compiled`, stackBytecodeInstructions);
         }
 
         if (JSGenerator.testingApparatus) {
