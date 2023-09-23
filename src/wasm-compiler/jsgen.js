@@ -1,5 +1,4 @@
 const log = require('../util/log');
-const Cast = require('../util/cast');
 const VariablePool = require('./variable-pool');
 const jsexecute = require('./jsexecute');
 // eslint-disable-next-line camelcase
@@ -107,93 +106,6 @@ class TypedInput {
     }
 }
 
-/**
- * @implements {Input}
- */
-class ConstantInput {
-    constructor (constantValue, safe) {
-        this.constantValue = constantValue;
-        this.safe = safe;
-    }
-
-    asNumber () {
-        // Compute at compilation time
-        const numberValue = +this.constantValue;
-        if (numberValue) {
-            // It's important that we use the number's stringified value and not the constant value
-            // Using the constant value allows numbers such as "010" to be interpreted as 8 (or SyntaxError in strict mode) instead of 10.
-            return numberValue.toString();
-        }
-        // numberValue is one of 0, -0, or NaN
-        if (Object.is(numberValue, -0)) {
-            return '-0';
-        }
-        return '0';
-    }
-
-    asNumberOrNaN () {
-        return this.asNumber();
-    }
-
-    asString () {
-        return `"${sanitize('' + this.constantValue)}"`;
-    }
-
-    asBoolean () {
-        // Compute at compilation time
-        return Cast.toBoolean(this.constantValue).toString();
-    }
-
-    asColor () {
-        // Attempt to parse hex code at compilation time
-        if (/^#[0-9a-f]{6,8}$/i.test(this.constantValue)) {
-            const hex = this.constantValue.substr(1);
-            return Number.parseInt(hex, 16).toString();
-        }
-        return this.asUnknown();
-    }
-
-    asUnknown () {
-        // Attempt to convert strings to numbers if it is unlikely to break things
-        if (typeof this.constantValue === 'number') {
-            // todo: handle NaN?
-            return this.constantValue;
-        }
-        const numberValue = +this.constantValue;
-        if (numberValue.toString() === this.constantValue) {
-            return this.constantValue;
-        }
-        return this.asString();
-    }
-
-    asSafe () {
-        if (this.safe) {
-            return this.asUnknown();
-        }
-        return this.asString();
-    }
-
-    isAlwaysNumber () {
-        const value = +this.constantValue;
-        if (Number.isNaN(value)) {
-            return false;
-        }
-        // Empty strings evaluate to 0 but should not be considered a number.
-        if (value === 0) {
-            return this.constantValue.toString().trim() !== '';
-        }
-        return true;
-    }
-
-    isAlwaysNumberOrNaN () {
-        return this.isAlwaysNumber();
-    }
-
-    isNeverNumber () {
-        return Number.isNaN(+this.constantValue);
-    }
-}
-
 const getNamesOfCostumesAndSounds = runtime => {
     const result = new Set();
     for (const target of runtime.targets) {
@@ -276,7 +188,6 @@ class JSGenerator {
         this.script = script;
         this.ir = ir;
         this.target = target;
-        this.source = '';
         /** @type {Array.<BytecodeInstruction>} */
         this.bytecodeSourceList = [];
 
@@ -619,10 +530,16 @@ class JSGenerator {
                 new BytecodeInstruction(InstructionType.OpOr)
             ];
         case 'op.random':
+            return [
+                ...this.descendInput(node.low),
+                ...this.descendInput(node.high),
+                new BytecodeInstruction(InstructionType.DataRand, node.useFloats ? 1 : 0)
+            ];
         case 'op.round':
-            // TODO needs implementation in scratch-vm-wasm-runtime
-            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
-            throw new Error('failed to compile (see above)');
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryRound)
+            ];
         case 'op.sin':
             return [
                 ...this.descendInput(node.value),
@@ -634,12 +551,21 @@ class JSGenerator {
                 new BytecodeInstruction(InstructionType.UnarySqrt)
             ];
         case 'op.subtract':
-            // Needs to be marked as NaN because Infinity - Infinity === NaN
-            return new TypedInput(`(${this.descendInput(node.left).asNumber()} - ${this.descendInput(node.right).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpSubtract)
+            ];
         case 'op.tan':
-            return new TypedInput(`tan(${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER_NAN);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.UnaryTan)
+            ];
         case 'op.10^':
-            return new TypedInput(`(10 ** ${this.descendInput(node.value).asNumber()})`, TYPE_NUMBER);
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.Unary10Pow)
+            ];
 
         case 'procedures.call': {
             const procedureCode = node.code;
@@ -678,20 +604,36 @@ class JSGenerator {
         case 'sensing.colorTouchingColor':
             return new TypedInput(`target.colorIsTouchingColor(colorToList(${this.descendInput(node.target).asColor()}), colorToList(${this.descendInput(node.mask).asColor()}))`, TYPE_BOOLEAN);
         case 'sensing.date':
-            return new TypedInput(`(new Date().getDate())`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataDate)
+            ];
         case 'sensing.dayofweek':
-            return new TypedInput(`(new Date().getDay() + 1)`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataWeekday)
+            ];
         case 'sensing.daysSince2000':
-            return new TypedInput('daysSince2000()', TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataDaysSince2000)
+            ];
         case 'sensing.distance':
             // TODO: on stages, this can be computed at compile time
             return new TypedInput(`distance(${this.descendInput(node.target).asString()})`, TYPE_NUMBER);
         case 'sensing.hour':
-            return new TypedInput(`(new Date().getHours())`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataHour)
+            ];
         case 'sensing.minute':
-            return new TypedInput(`(new Date().getMinutes())`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataMinute)
+            ];
         case 'sensing.month':
-            return new TypedInput(`(new Date().getMonth() + 1)`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataMinute)
+            ];
+        case 'sensing.second':
+            return [
+                new BytecodeInstruction(InstructionType.DataSecond)
+            ];
         case 'sensing.of': {
             const object = this.descendInput(node.object).asString();
             const property = node.property;
@@ -732,8 +674,6 @@ class JSGenerator {
             }
             return new TypedInput(`runtime.ext_scratch3_sensing.getAttributeOf({OBJECT: ${object}, PROPERTY: "${sanitize(property)}" })`, TYPE_UNKNOWN);
         }
-        case 'sensing.second':
-            return new TypedInput(`(new Date().getSeconds())`, TYPE_NUMBER);
         case 'sensing.touching':
             return new TypedInput(`target.isTouchingObject(${this.descendInput(node.object).asUnknown()})`, TYPE_BOOLEAN);
         case 'sensing.touchingColor':
@@ -741,7 +681,9 @@ class JSGenerator {
         case 'sensing.username':
             return new TypedInput('runtime.ioDevices.userData.getUsername()', TYPE_STRING);
         case 'sensing.year':
-            return new TypedInput(`(new Date().getFullYear())`, TYPE_NUMBER);
+            return [
+                new BytecodeInstruction(InstructionType.DataYear)
+            ];
 
         case 'timer.get':
             return new TypedInput('runtime.ioDevices.clock.projectTimer()', TYPE_NUMBER);
@@ -750,7 +692,9 @@ class JSGenerator {
             return new TypedInput('runtime.ioDevices.keyboard.getLastKeyPressed()', TYPE_STRING);
 
         case 'var.get':
-            return this.descendVariable(node.variable);
+            return [
+                new BytecodeInstruction(InstructionType.Load, this.referenceWasmVariable(node.variable))
+            ];
 
         default:
             log.warn(`JS: Unknown input: ${node.kind}`, node);
@@ -893,51 +837,37 @@ class JSGenerator {
             break;
 
         case 'list.add': {
-            const list = this.referenceVariable(node.list);
-            this.source += `${list}.value.push(${this.descendInput(node.item).asSafe()});\n`;
-            this.source += `${list}._monitorUpToDate = false;\n`;
-            break;
+            return [
+                ...this.descendInput(node.item),
+                new BytecodeInstruction(InstructionType.ListPush, this.referenceList(node.list))
+            ];
         }
         case 'list.delete': {
-            const list = this.referenceVariable(node.list);
-            const index = this.descendInput(node.index);
-            if (index instanceof ConstantInput) {
-                if (index.constantValue === 'last') {
-                    this.source += `${list}.value.pop();\n`;
-                    this.source += `${list}._monitorUpToDate = false;\n`;
-                    break;
-                }
-                if (+index.constantValue === 1) {
-                    this.source += `${list}.value.shift();\n`;
-                    this.source += `${list}._monitorUpToDate = false;\n`;
-                    break;
-                }
-                // do not need a special case for all as that is handled in IR generation (list.deleteAll)
-            }
-            this.source += `listDelete(${list}, ${index.asUnknown()});\n`;
-            break;
+            return [
+                ...this.descendInput(node.index),
+                new BytecodeInstruction(InstructionType.ListDel, this.referenceList(node.list))
+            ];
         }
         case 'list.deleteAll':
-            this.source += `${this.referenceVariable(node.list)}.value = [];\n`;
-            break;
+            return [
+                new BytecodeInstruction(InstructionType.ListDelAll, this.referenceList(node.list))
+            ];
         case 'list.hide':
             this.source += `runtime.monitorBlocks.changeBlock({ id: "${sanitize(node.list.id)}", element: "checkbox", value: false }, runtime);\n`;
             break;
         case 'list.insert': {
-            const list = this.referenceVariable(node.list);
-            const index = this.descendInput(node.index);
-            const item = this.descendInput(node.item);
-            if (index instanceof ConstantInput && +index.constantValue === 1) {
-                this.source += `${list}.value.unshift(${item.asSafe()});\n`;
-                this.source += `${list}._monitorUpToDate = false;\n`;
-                break;
-            }
-            this.source += `listInsert(${list}, ${index.asUnknown()}, ${item.asSafe()});\n`;
-            break;
+            return [
+                ...this.descendInput(node.index),
+                ...this.descendInput(node.item),
+                new BytecodeInstruction(InstructionType.ListIns, this.referenceList(node.list))
+            ];
         }
         case 'list.replace':
-            this.source += `listReplace(${this.referenceVariable(node.list)}, ${this.descendInput(node.index).asUnknown()}, ${this.descendInput(node.item).asSafe()});\n`;
-            break;
+            return [
+                ...this.descendInput(node.index),
+                ...this.descendInput(node.item),
+                new BytecodeInstruction(InstructionType.ListReplace, this.referenceList(node.list))
+            ];
         case 'list.show':
             this.source += `runtime.monitorBlocks.changeBlock({ id: "${sanitize(node.list.id)}", element: "checkbox", value: true }, runtime);\n`;
             break;
@@ -1120,14 +1050,11 @@ class JSGenerator {
             this.source += `runtime.monitorBlocks.changeBlock({ id: "${sanitize(node.variable.id)}", element: "checkbox", value: false }, runtime);\n`;
             break;
         case 'var.set': {
-            const variable = this.descendVariable(node.variable);
-            const value = this.descendInput(node.value);
-            variable.setInput(value);
-            this.source += `${variable.source} = ${value.asSafe()};\n`;
-            if (node.variable.isCloud) {
-                this.source += `runtime.ioDevices.cloud.requestUpdateVariable("${sanitize(node.variable.name)}", ${variable.source});\n`;
-            }
-            break;
+            // TODO: Handle cloud updates
+            return [
+                ...this.descendInput(node.value),
+                new BytecodeInstruction(InstructionType.Store, this.referenceList(node.variable))
+            ];
         }
         case 'var.show':
             this.source += `runtime.monitorBlocks.changeBlock({ id: "${sanitize(node.variable.id)}", element: "checkbox", value: true }, runtime);\n`;
@@ -1244,6 +1171,37 @@ class JSGenerator {
                 variables.set(index, variable);
             });
         };
+        let stack = [];
+        let programCounter = 0;
+        const runWasm = (runtime, target, stage) => {
+            refreshVars(target, stage);
+            const output = run_sync(
+                programCounter,
+                stack,
+                bytecode,
+                constants,
+                variables,
+                lists
+            );
+            const {
+                variables: _newVariables,
+                lists: _newLists,
+                stack: newStack,
+                programCounter: newProgramCounter,
+                returnReason
+            } = output;
+            log.debug(output);
+            stack = newStack;
+            programCounter = newProgramCounter;
+            if (typeof returnReason !== 'undefined') {
+                switch (returnReason) {
+                case ReturnReason.VisualReport: {
+                    runtime.visualReport(this.script.topBlockId, stack.pop());
+                    break;
+                }
+                }
+            }
+        };
         
         this.stopScript();
 
@@ -1253,18 +1211,10 @@ class JSGenerator {
             log.debug(target);
             const runtime = target.runtime;
             const stage = runtime.getTargetForStage();
-            refreshVars(target, stage);
-            log.debug('running with', bytecode, constants, variables, lists);
-            log.debug(Object.fromEntries(run_sync(
-                /* initial_project_counter: */ 0,
-                /* initial_stack: */ [],
-                bytecode,
-                constants,
-                variables,
-                lists
-            )));
-            log.debug('hi there, running');
-            log.debug(globalState);
+            while (programCounter < bytecode.length) {
+                runWasm(runtime, target, stage);
+                yield;
+            }
             // Finish thread
             runtime.sequencer.retireThread(globalState.thread);
         });
