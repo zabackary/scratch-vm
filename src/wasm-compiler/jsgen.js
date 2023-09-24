@@ -143,6 +143,13 @@ class Frame {
 }
 
 class BytecodeInstruction {
+    static get signedArgumentInstructionTypes () {
+        return [
+            InstructionType.Jump,
+            InstructionType.JumpIf
+        ];
+    }
+
     /**
      * Creates an instruction to add the bytecode.
      *
@@ -174,7 +181,11 @@ class BytecodeInstruction {
         // 2 bytes of padding in between
         const argument = new DataView(buffer, offset + 4, 4);
         instruction.setUint16(0, this.type, true);
-        argument.setUint32(0, this.arg, true);
+        if (BytecodeInstruction.signedArgumentInstructionTypes.includes(this.type)) {
+            argument.setInt32(0, this.arg, true);
+        } else {
+            argument.setUint32(0, this.arg, true);
+        }
     }
 }
 
@@ -204,13 +215,13 @@ class JSGenerator {
 
         /**
          * An array of list IDs
-         * @type {Array.<string>}
+         * @type {Array.<*>}
          */
         this.lists = [];
 
         /**
-         * An array of variable IDs
-         * @type {Array.<string>}
+         * An array of variables
+         * @type {Array.<*>}
          */
         this.variables = [];
 
@@ -235,6 +246,8 @@ class JSGenerator {
         this.localVariables = new VariablePool('a');
         this._setupVariablesPool = new VariablePool('b');
         this._setupVariables = {};
+
+        this.utilityVariablePool = new VariablePool('util');
 
         this.descendedIntoModulo = false;
         this.isInHat = false;
@@ -304,9 +317,9 @@ class JSGenerator {
      * @returns {number} The key in the list array of the value
      */
     referenceList (list) {
-        const cached = this.lists.indexOf(list.id);
+        const cached = this.lists.findIndex(candidate => candidate.id === list.id);
         if (cached > -1) return cached;
-        return this.lists.push(list.id) - 1;
+        return this.lists.push(list) - 1;
     }
 
     /**
@@ -315,9 +328,25 @@ class JSGenerator {
      * @returns {number} The key in the list array of the value
      */
     referenceWasmVariable (variable) {
-        const cached = this.lists.indexOf(variable.id);
+        const cached = this.variables.findIndex(candidate => candidate.id === variable.id);
         if (cached > -1) return cached;
-        return this.lists.push(variable.id) - 1;
+        return this.variables.push(variable) - 1;
+    }
+
+    /**
+     * Gets the key for the next utility variable.
+     * @param {*} initialValue The initial value to set it to in the VM
+     * @returns {number} the key
+     */
+    referenceUtilityVariable (initialValue) {
+        return this.variables.push({
+            id: this.utilityVariablePool.next(),
+            isCloud: false,
+            isUtility: true,
+            name: null,
+            scope: null,
+            initialValue
+        }) - 1;
     }
 
     /**
@@ -476,28 +505,33 @@ class JSGenerator {
             ];
         case 'op.greater':
             return [
-                ...this.descendInput(node.right),
                 ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
                 new BytecodeInstruction(InstructionType.OpLt)
             ];
         case 'op.join':
-            // TODO needs implementation in scratch-vm-wasm-runtime
-            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
-            throw new Error('failed to compile (see above)');
-        case 'op.length':
-            // TODO needs implementation in scratch-vm-wasm-runtime
-            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
-            throw new Error('failed to compile (see above)');
-        case 'op.less':
             return [
                 ...this.descendInput(node.left),
                 ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.StringConcat)
+            ];
+        case 'op.length':
+            return [
+                ...this.descendInput(node.string),
+                new BytecodeInstruction(InstructionType.StringLen)
+            ];
+        case 'op.less':
+            return [
+                ...this.descendInput(node.right),
+                ...this.descendInput(node.left),
                 new BytecodeInstruction(InstructionType.OpLt)
             ];
         case 'op.letterOf':
-            // TODO needs implementation in scratch-vm-wasm-runtime
-            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
-            throw new Error('failed to compile (see above)');
+            return [
+                ...this.descendInput(node.string),
+                ...this.descendInput(node.letter),
+                new BytecodeInstruction(InstructionType.StringIndexChar)
+            ];
         case 'op.ln':
             return [
                 ...this.descendInput(node.value),
@@ -509,9 +543,11 @@ class JSGenerator {
                 new BytecodeInstruction(InstructionType.UnaryLog)
             ];
         case 'op.mod':
-            // TODO needs implementation in scratch-vm-wasm-runtime
-            log.warn(`WASM: No compiler implementation for \`${node.kind}\``);
-            throw new Error('failed to compile (see above)');
+            return [
+                ...this.descendInput(node.left),
+                ...this.descendInput(node.right),
+                new BytecodeInstruction(InstructionType.OpMod)
+            ];
         case 'op.multiply':
             return [
                 ...this.descendInput(node.left),
@@ -740,24 +776,63 @@ class JSGenerator {
             this.source += '}\n';
             break;
         }
-        case 'control.if':
-            this.source += `if (${this.descendInput(node.condition).asBoolean()}) {\n`;
-            this.descendStack(node.whenTrue, new Frame(false));
-            // only add the else branch if it won't be empty
-            // this makes scripts have a bit less useless noise in them
-            if (node.whenFalse.length) {
-                this.source += `} else {\n`;
-                this.descendStack(node.whenFalse, new Frame(false));
+        case 'control.if': {
+            const ifBranch = this.descendStack(node.whenTrue, new Frame(false));
+            const elseBranch = this.descendStack(node.whenFalse, new Frame(false));
+            if (elseBranch.length > 0) {
+                // If-else block
+                return [
+                    ...this.descendInput(node.condition),
+                    new BytecodeInstruction(InstructionType.JumpIf, elseBranch.length + 1),
+                    ...elseBranch,
+                    new BytecodeInstruction(InstructionType.Jump, ifBranch.length),
+                    ...ifBranch
+                ];
             }
-            this.source += `}\n`;
-            break;
+            // Just if block
+            return [
+                ...this.descendInput(node.condition),
+                new BytecodeInstruction(InstructionType.UnaryNot),
+                new BytecodeInstruction(InstructionType.JumpIf, ifBranch.length),
+                ...ifBranch
+            ];
+        }
         case 'control.repeat': {
-            const i = this.localVariables.next();
-            this.source += `for (var ${i} = ${this.descendInput(node.times).asNumber()}; ${i} >= 0.5; ${i}--) {\n`;
-            this.descendStack(node.do, new Frame(true));
-            this.yieldLoop();
-            this.source += `}\n`;
-            break;
+            const counterVariable = this.referenceUtilityVariable(0);
+            const loopDecrement = [
+                // Subtract 1 from the counter variable
+                new BytecodeInstruction(InstructionType.Load, counterVariable),
+                new BytecodeInstruction(InstructionType.LoadConst, this.referenceConstant(1)),
+                new BytecodeInstruction(InstructionType.OpSubtract),
+                new BytecodeInstruction(InstructionType.Store, counterVariable)
+            ];
+            const loopInner = [
+                // Execute the inside
+                ...this.descendStack(node.do, new Frame(true)),
+                // Yield the loop to scratch-gui if applicable
+                ...this.yieldLoop()
+            ];
+            const loopCheckJump = [
+                // Check if we're done
+                new BytecodeInstruction(InstructionType.Load, counterVariable),
+                new BytecodeInstruction(InstructionType.LoadConst, this.referenceConstant(0.5)),
+                new BytecodeInstruction(InstructionType.OpLt),
+                new BytecodeInstruction(InstructionType.UnaryNot),
+                // Shortcut the loop if we are
+                new BytecodeInstruction(InstructionType.JumpIf, loopDecrement.length + loopInner.length + 1)
+            ];
+            return [
+                // Initialize counter variable
+                ...this.descendInput(node.times),
+                new BytecodeInstruction(InstructionType.Store, counterVariable),
+                // Start of loop
+                ...loopCheckJump,
+                ...loopDecrement,
+                ...loopInner,
+                // Restart the loop
+                new BytecodeInstruction(InstructionType.Jump, -(loopCheckJump.length + loopDecrement.length + loopInner.length + 1))
+                // End of loop
+            ];
         }
         case 'control.stopAll':
             this.source += 'runtime.stopAll();\n';
@@ -789,17 +864,18 @@ class JSGenerator {
             this.source += `}\n`;
             break;
         }
-        case 'control.while':
-            this.resetVariableInputs();
-            this.source += `while (${this.descendInput(node.condition).asBoolean()}) {\n`;
-            this.descendStack(node.do, new Frame(true));
-            if (node.warpTimer) {
-                this.yieldStuckOrNotWarp();
-            } else {
-                this.yieldLoop();
-            }
-            this.source += `}\n`;
-            break;
+        case 'control.while': {
+            const loopInner = [
+                ...this.descendStack(node.do, new Frame(true)),
+                ...this.yieldLoop()
+            ];
+            return [
+                ...this.descendInput(node.condition),
+                ...new BytecodeInstruction(InstructionType.UnaryNot),
+                ...new BytecodeInstruction(InstructionType.JumpIf, loopInner.length),
+                ...loopInner
+            ];
+        }
 
         case 'hat.edge':
             this.isInHat = true;
@@ -1053,7 +1129,7 @@ class JSGenerator {
             // TODO: Handle cloud updates
             return [
                 ...this.descendInput(node.value),
-                new BytecodeInstruction(InstructionType.Store, this.referenceList(node.variable))
+                new BytecodeInstruction(InstructionType.Store, this.referenceWasmVariable(node.variable))
             ];
         }
         case 'var.show':
@@ -1071,6 +1147,23 @@ class JSGenerator {
             log.warn(`JS: Unknown stacked block: ${node.kind}`, node);
             throw new Error(`JS: Unknown stacked block: ${node.kind}`);
         }
+    }
+
+    yieldLoop () {
+        if (this.warpTimer) {
+            if (this.isWarp) {
+                // Since stuck checking isn't impl'ed yet, do nothing.
+                return [];
+            }
+            return [
+                new BytecodeInstruction(InstructionType.Return, ReturnReason.LoopYield)
+            ];
+            
+        }
+        return [
+            new BytecodeInstruction(InstructionType.Return, ReturnReason.LoopYield)
+        ];
+        
     }
 
     retire () {
@@ -1141,6 +1234,7 @@ class JSGenerator {
         // eslint-disable-next-line no-undef
         const bytecode = new BigUint64Array(bytecodeBuffer);
         // Process the constants, vars, lists
+        const utilityVarState = {};
         const constants = new Map();
         this.constants.forEach((constant, index) => {
             constants.set(index, constant);
@@ -1149,32 +1243,34 @@ class JSGenerator {
         const variables = new Map();
         const refreshVars = (target, stage) => {
             lists.clear();
-            this.lists.forEach((listID, index) => {
-                let list;
-                if (target.variables.hasOwnProperty(listID)) {
-                    // Assume it's on the sprite, not the stage
-                    list = target.variables[listID].value;
-                } else {
-                    list = stage.variables[listID].value;
-                }
-                lists.set(index, list.join('\0'));
+            this.lists.forEach((list, index) => {
+                const initialValue = (list.scope === 'stage' ? stage.variables[list.id].value : target.variables[list.id].value) ?? 0;
+                lists.set(index, initialValue.join('\0'));
             });
             variables.clear();
-            this.variables.forEach((variableID, index) => {
-                let variable;
-                if (target.variables.hasOwnProperty(variableID)) {
-                    // Assume it's on the sprite, not the stage
-                    variable = target.variables[variableID].value;
+            this.variables.forEach((variable, index) => {
+                let initialValue;
+                if (variable.isUtility) {
+                    if (!Object.hasOwn(utilityVarState, variable.id)) {
+                        utilityVarState[variable.id] = variable.initialValue;
+                    }
+                    initialValue = utilityVarState[variable.id];
                 } else {
-                    variable = stage.variables[variableID].value;
+                    log.debug(variable);
+                    // If it's on the stage, get it from there. Else get it from
+                    // ourselves. This may prove to be a weak assumption.
+                    initialValue = (variable.scope === 'stage' ? stage.variables[variable.id].value : target.variables[variable.id].value) ?? 0;
                 }
-                variables.set(index, variable);
+                // We should do something if variable.isCloud === true.
+                variables.set(index, initialValue);
             });
+            log.debug(variables);
         };
         let stack = [];
         let programCounter = 0;
         const runWasm = (runtime, target, stage) => {
             refreshVars(target, stage);
+            log.debug(bytecode);
             const output = run_sync(
                 programCounter,
                 stack,
@@ -1184,8 +1280,8 @@ class JSGenerator {
                 lists
             );
             const {
-                variables: _newVariables,
-                lists: _newLists,
+                variables: newVariables,
+                lists: newLists,
                 stack: newStack,
                 programCounter: newProgramCounter,
                 returnReason
@@ -1201,6 +1297,24 @@ class JSGenerator {
                 }
                 }
             }
+            newVariables.forEach((value, variableIndex) => {
+                const variable = this.variables[variableIndex];
+                if (variable.isUtility) {
+                    utilityVarState[variable.id] = value;
+                } else if (variable.scope === 'stage') {
+                    stage.variables[variable.id].value = value;
+                } else {
+                    target.variables[variable.id].value = value;
+                }
+            });
+            newLists.forEach((value, listIndex) => {
+                const list = this.lists[listIndex];
+                if (list.scope === 'stage') {
+                    stage.variables[list.id].value = value.split('\0');
+                } else {
+                    target.variables[list.id].value = value.split('\0');
+                }
+            });
         };
         
         this.stopScript();
